@@ -227,6 +227,92 @@ bash install.sh --uninstall
 
 ---
 
+## Technical Audit, Known Issues & Roadmap
+
+Now the source files should be fetchable.
+
+I read the privileged helper (`asus-thermal-profile`) in full and the first 1,000 lines of `app.py`. GitHub's viewer cuts off there, and the raw file is blocked to me, so I haven't seen the remaining ~1,376 lines. That's where the GUI, daemon loop, limiter logic and CLI live. Everything below is from code I actually read.
+
+### Corrections to my earlier review
+
+I guessed based on the README, and several guesses were wrong. The code is better than the README suggests:
+
+- The fan safety floor, emergency override and restore-on-exit **exist** (helper and `FanSafetyController`).
+- Battery charge limit **exists**.
+- Throttle detection and top-process lookup **exist**.
+- The limiter has min-dwell and confirm-sample logic, and hysteresis is configurable.
+- The config directory has already been renamed to `~/.config/thermals`, with migration.
+- The helper's input validation is solid for the commands I could see.
+
+The README is stale against the code. It documents the old config path and the old name, shows a fixed 5°C hysteresis, and lists 9 config keys when the code has about 16.
+
+### Bugs I can point to
+
+**1. `grep -qw` false positives in the helper (profile command).**
+`grep -qw -- "$ARG" "$PROFILE_STD_CHOICES"` treats `-` as a word boundary, so `balanced` matches inside `balanced-performance`. On a system that lists `balanced-performance` but not `balanced`, validation passes, the sysfs write fails with EINVAL, and `set -e` kills the script with an ugly error. Fix:
+```bash
+tr -s ' ' '\n' < "$PROFILE_STD_CHOICES" | grep -qxF -- "$ARG"
+```
+
+**2. Wrong PWM files collected.**
+`hw.glob("pwm[0-9]*")` and filtering only on `_enable` also matches `pwm1_freq`, `pwm1_mode` and `pwm1_auto_point*`. Those land in `fan_pwm_files`. The helper's regex will reject them, but they pollute the UI and the restore loop. Use `re.fullmatch(r"pwm\d+", name)`.
+
+**3. `set_cpu_epp` doesn't set EPP when power-profiles-daemon exists.**
+It maps EPP to a whole PPD profile (`balance_power` collapses to `power-saver`) and returns success. The user asks for an EPP change and gets a platform-profile switch. That also fights your target limiter, which switches profiles itself. Write EPP to sysfs directly and don't route it through PPD.
+
+**4. Dead validation in the helper's `fan` command.**
+`CANON_PATH` from `readlink -f` is only checked for non-empty and never used. The regex does the real work, which is fine, but delete the pretense or enforce that the canonical path stays under `/sys/devices`.
+
+**5. Cooler Boost state ownership is broken by design.**
+`restore_all_fans` returns immediately if `_manual_active` is False. The helper's `cooler-boost` forces every `pwm[1-9]` on every hwmon to manual 255 with no record kept. There are two possible outcomes, depending on code I couldn't see. If the one-shot CLI `thermals --cooler-boost` sets `_manual_active`, its `atexit` handler restores auto the moment the process exits, so Cooler Boost lasts about zero seconds. If it doesn't set the flag, nothing ever restores the fans. Either way, manual fan state needs a persistent owner: a daemon plus a state file (`daemon_state.json` is already there), restored on startup and on service stop. In both cases a SIGKILL or crash leaves fans pinned.
+
+**6. `pwm_enable = 2` isn't universally "auto".**
+For some drivers (nct6775 variants, for instance) automatic modes use other values. Keep a per-driver map or fall back to saving and restoring the original `pwm_enable` value you read before taking control. Restoring what you read is the more robust approach.
+
+**7. Chip classification by substring.**
+`"xe" in chip`, `"core" in label`, `"gt"`, `"phy"`, `"hp"` are all fragile. The CPU check runs first and matches `"core"` in labels, so a GPU sensor labelled "GPU core" is classified as CPU. Classify by driver (`hwmon/*/device/driver` symlink) or PCI class instead of name fragments.
+
+**8. Temperature unit heuristic.**
+`v / 1000 if v > 1000 else v` is wrong by spec: `temp*_input` is always millidegrees. A real 0.9°C reading would display as 900°C, and negative values pass through. Always divide by 1000.
+
+**9. Import-time side effects.**
+`FanSafetyController.register_exit_handlers()` runs at module scope, installing SIGINT/SIGTERM/SIGHUP handlers and an `atexit` hook whenever the module is imported. That includes tests. Move it into `main()`. Also, the signal handler calls `get_registry()`, which can trigger a full hardware scan inside a signal handler if the registry is still None.
+
+**10. Config handling is unvalidated and non-atomic.**
+`load_config` copies values in without type or range checks, so `"target_temp_c": "hot"` goes straight to the control loop. `save_config` uses `write_text`, which can leave a truncated file on a crash. Clamp and validate on load, and write to a temp file then `os.replace`.
+
+### Design and security
+
+- **PPD plus direct sysfs writes conflict.** `set_profile` tries direct sysfs, then `powerprofilesctl`, then the helper, then pkexec. Mixing them means PPD's idea of the active profile diverges from the kernel's. Pick one authority per system and detect which.
+- **`pkexec /usr/bin/tee <path>`** trains users to authenticate a generic "run tee as root" dialog. Ship a proper polkit action for your helper with a readable message and `auth_admin_keep`.
+- **Throttle detection is a heuristic.** It triggers on 82°C or higher, frequency under 50% of `cpuinfo_max_freq` on policy0 only, and load of 60% or higher. A power-saving EPP can produce the same frequency drop without throttling. On Intel, read `thermal_throttle/*_throttle_count` for ground truth. For AMD, keep the heuristic but label it "possible."
+- **The emergency override is a fixed 80°C.** Many Ryzen U-series chips sit above 80°C under ordinary load, so this fires constantly for them. It should be configurable, and I can't tell whether the slider or daemon reapplies manual mode right after the override fires. Check that, because it would cause oscillation at the threshold.
+- **Helper scope.** The commands I read look well validated. I haven't seen `install-helper.sh`, so I can't tell who the sudoers rule covers (a specific user or an entire group), whether the file is `0440 root:root`, or whether it's checked with `visudo -c`. Verify that.
+- **Architecture.** A 2,376-line single file with global mutable state (`_REGISTRY`, class-level `_manual_active`), classes that are all classmethods, and hard-coded module-level paths. This makes testing hard. Split into a package (`sensors`, `control`, `daemon`, `cli`, `gui`) and inject a `SYSFS_ROOT` so you can point it at a fake tree.
+- **Possible UI blocking.** `get_available_profiles` and `get_current_profile` run `powerprofilesctl` subprocesses with 2-second timeouts. If those are called from the Tk poll loop, the UI freezes whenever PPD is slow. I couldn't see where they're called, so check it.
+
+### Features worth building next
+
+1. A systemd service that owns manual fan state, the limiter, and automation, with `ExecStopPost=… restore-fans`. This fixes the biggest design hole above.
+2. Fan curves (temperature to PWM points) on top of the existing safety rails.
+3. Intel throttle counters and AMD `amd_pstate` status for real throttle reporting.
+4. Per-sensor thresholds from `crit` and `max` everywhere, not fixed 65/75/85.
+5. AC vs battery profile switching.
+6. CSV export of history. The tray icon and Waybar examples are easy wins given the JSON output.
+7. A fake-sysfs test suite using fixtures contributed from real machines, plus an issue template that asks for `thermals --list-hardware` output.
+
+### What I'd do first
+
+1. Fix the `grep -qw` bug, the PWM glob, and the EPP-via-PPD behavior. They're small and real.
+2. Resolve fan state ownership (daemon plus state file plus systemd stop hook).
+3. Update the README to match the code, and fix the clone URL and install instructions. I flagged these last time and they still hold.
+4. Move the signal and atexit setup out of import time, then add tests against a fake sysfs.
+5. Read `install-helper.sh` for the sudoers scope.
+
+To review the rest of the app (GUI thread usage, limiter loop, daemon), paste lines 1000 onward in chunks, or just the limiter/daemon and the `--cooler-boost` code path. The limiter loop is the part I'd most like to see.
+
+---
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
